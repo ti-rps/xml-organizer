@@ -1,187 +1,180 @@
-# xml_organizer.py
 import os
 import shutil
 import xml.etree.ElementTree as ET
+from pathlib import Path
 from datetime import datetime
-import re
-import time
-import sqlite3
 import pandas as pd
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
+import logging
 
-SOURCE_DIR = os.getenv('SOURCE_DIR', r"/data/source")
-DEST_DIR = os.getenv('DEST_DIR', r"/data/destination")
-DB_PATH = os.getenv('DB_PATH', '/data/db/history.db')
-SLEEP_INTERVAL_SECONDS = int(os.getenv('SLEEP_INTERVAL_SECONDS', 300))
+SOURCE_DIRECTORY = Path("/mnt/c/Automations")
+DESTINATION_NETWORK_DIRECTORY = Path("/mnt/r/XML_ASINCRONIZAR/ZZZ_XML_BOT")
+GOOGLE_SHEET_NAME = "HIST. XML BOTS"
+CREDENTIALS_FILE = "credentials.json"
 
-GOOGLE_SHEET_NAME = os.getenv('GOOGLE_SHEET_NAME', 'HISTORICO XML A SINCRONIZAR')
-GOOGLE_CREDENTIALS_FILE = os.getenv('GOOGLE_CREDENTIALS_FILE', 'credentials.json')
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler("xml_organizer.log"),
+        logging.StreamHandler()
+    ]
+)
 
-def sanitize_filename(name):
-    return re.sub(r'[\\/*?:"<>|]', "", name)
-
-def init_db():
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS xml_history (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            razao_social TEXT NOT NULL,
-            cnpj TEXT NOT NULL,
-            data_emissao_xml DATE,
-            tipo_documento TEXT,
-            nome_arquivo TEXT,
-            caminho_destino TEXT,
-            data_movimentacao DATETIME NOT NULL,
-            status TEXT NOT NULL
-        )
-    ''')
-    conn.commit()
-    conn.close()
-
-def log_to_db(data):
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    cursor.execute('''
-        INSERT INTO xml_history (
-            razao_social, cnpj, data_emissao_xml, tipo_documento, 
-            nome_arquivo, caminho_destino, data_movimentacao, status
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-    ''', (
-        data.get("razao_social"), data.get("cnpj"), data.get("data_emissao"), 
-        data.get("doc_type"), data.get("filename"), data.get("dest_path"),
-        datetime.now(), data.get("status")
-    ))
-    conn.commit()
-    conn.close()
-
-def find_xml_files(directory):
-    xml_files = []
-    print(f"Iniciando varredura em: {directory}")
-    if not os.path.exists(directory):
-        print(f"ERRO CRÍTICO: O diretório de origem '{directory}' não foi encontrado.")
-        return []
-    
-    for root, _, files in os.walk(directory):
-        for file in files:
-            if file.lower().endswith('.xml'):
-                xml_files.append(os.path.join(root, file))
-    return xml_files
-
-def parse_xml_data(xml_path):
+def get_xml_info(xml_file: Path) -> dict:
+    ns = {'nfe': 'http://www.portalfiscal.inf.br/nfe'}
     try:
-        tree = ET.parse(xml_path)
+        tree = ET.parse(xml_file)
         root = tree.getroot()
-        ns = {'nfe': 'http://www.portalfiscal.inf.br/nfe'}
 
         infNFe = root.find('.//nfe:infNFe', ns)
         if infNFe is None:
-            infNFe = root.find('.//infNFe')
-            if infNFe is None: return None, "Tag 'infNFe' não encontrada"
-            ns = {}
+            logging.warning(f"Arquivo '{xml_file.name}' não é uma NF-e/NFC-e válida (tag 'infNFe' não encontrada).")
+            return None
 
-        emit_xnome_element = infNFe.find('nfe:emit/nfe:xNome', ns) if ns else infNFe.find('emit/xNome')
-        razao_social = emit_xnome_element.text if emit_xnome_element is not None else "RAZAO_SOCIAL_NAO_ENCONTRADA"
+        chave_acesso = infNFe.get('Id', '')[3:]
 
-        emit_cnpj_element = infNFe.find('nfe:emit/nfe:CNPJ', ns) if ns else infNFe.find('emit/CNPJ')
-        cnpj = emit_cnpj_element.text if emit_cnpj_element is not None else "CNPJ_NAO_ENCONTRADO"
+        ide = infNFe.find('nfe:ide', ns)
+        emit = infNFe.find('nfe:emit', ns)
 
-        ide_dhemi_element = infNFe.find('nfe:ide/nfe:dhEmi', ns) if ns else infNFe.find('ide/dhEmi')
-        if ide_dhemi_element is None:
-            return None, "Data de emissão (dhEmi) não encontrada"
-        
-        data_emissao_str = ide_dhemi_element.text.split('T')[0]
-        data_emissao = datetime.strptime(data_emissao_str, '%Y-%m-%d').date()
+        if ide is None or emit is None:
+            logging.warning(f"Arquivo '{xml_file.name}' não possui as tags 'ide' ou 'emit'.")
+            return None
 
-        ide_mod_element = infNFe.find('nfe:ide/nfe:mod', ns) if ns else infNFe.find('ide/mod')
-        doc_type = "TIPO_DESCONHECIDO"
-        if ide_mod_element is not None:
-            if ide_mod_element.text == '55': doc_type = "NFe"
-            elif ide_mod_element.text == '65': doc_type = "NFCe"
-            else: doc_type = f"MOD_{ide_mod_element.text}"
+        dhEmi_element = ide.find('nfe:dhEmi', ns)
+        data_emissao_str = dhEmi_element.text.split('T')[0] if dhEmi_element is not None else ''
+        data_emissao_dt = datetime.strptime(data_emissao_str, '%Y-%m-%d')
+
+        mod_element = ide.find('nfe:mod', ns)
+        modelo = mod_element.text if mod_element is not None else ''
+        if modelo == '55':
+            tipo_documento = 'NFE'
+        elif modelo == '65':
+            tipo_documento = 'NFCE'
+        else:
+            tipo_documento = f"Modelo_{modelo}"
+
+        cnpj = emit.find('nfe:CNPJ', ns).text
+        nome_empresa = emit.find('nfe:xNome', ns).text
 
         return {
-            "razao_social": razao_social,
+            "data_leitura": datetime.now().strftime('%Y-%m-%d'),
+            "hora_leitura": datetime.now().strftime('%H:%M:%S'),
+            "data_emissao": data_emissao_dt.strftime('%Y-%m-%d'),
+            "chave_acesso": chave_acesso,
+            "empresa": nome_empresa,
             "cnpj": cnpj,
-            "data_emissao": data_emissao_str,
-            "doc_type": doc_type,
-        }, None
+            "tipo_documento": tipo_documento,
+            "ano_emissao": data_emissao_dt.strftime('%Y'),
+            "mes_ano_emissao": data_emissao_dt.strftime('%m-%Y'),
+            "dia_emissao": data_emissao_dt.strftime('%d')
+        }
 
     except ET.ParseError:
-        return None, "XML mal formatado"
+        logging.error(f"Erro de parsing no XML '{xml_file.name}'. O arquivo pode estar corrompido.")
+        return None
     except Exception as e:
-        return None, f"Erro inesperado no parse: {e}"
+        logging.error(f"Erro inesperado ao processar o arquivo '{xml_file.name}': {e}")
+        return None
 
-def update_google_sheet():
+
+def update_google_sheet(data: dict):
     try:
-        print("Atualizando planilha do Google Sheets...")
-        scope = ['https://spreadsheets.google.com/feeds', 'https://www.googleapis.com/auth/drive']
-        creds = ServiceAccountCredentials.from_json_keyfile_name(GOOGLE_CREDENTIALS_FILE, scope)
+        scope = ["https://spreadsheets.google.com/feeds", 'https://www.googleapis.com/auth/spreadsheets',
+                 "https://www.googleapis.com/auth/drive.file", "https://www.googleapis.com/auth/drive"]
+        
+        creds = ServiceAccountCredentials.from_json_keyfile_name(CREDENTIALS_FILE, scope)
         client = gspread.authorize(creds)
-
+        
         sheet = client.open(GOOGLE_SHEET_NAME).sheet1
         
-        conn = sqlite3.connect(DB_PATH)
-        df = pd.read_sql_query("SELECT * FROM xml_history ORDER BY data_movimentacao DESC", conn)
-        conn.close()
+        df_row = pd.DataFrame([{
+            "Data Leitura": data["data_leitura"],
+            "Hora Leitura": data["hora_leitura"],
+            "Data Emissão": data["data_emissao"],
+            "Chave Acesso": data["chave_acesso"],
+            "Empresa": data["empresa"],
+            "CNPJ": data["cnpj"],
+            "Tipo Documento": data["tipo_documento"]
+        }])
 
-        sheet.clear()
-        sheet.update([df.columns.values.tolist()] + df.values.tolist())
-        print("-> Planilha atualizada com sucesso!")
-    except FileNotFoundError:
-        print(f"ERRO: Arquivo de credenciais '{GOOGLE_CREDENTIALS_FILE}' não encontrado. A atualização da planilha foi ignorada.")
+        sheet.append_rows(df_row.values.tolist(), value_input_option='USER_ENTERED')
+        logging.info(f"Dados da nota {data['chave_acesso']} registrados na planilha.")
+        return True
+
     except Exception as e:
-        print(f"ERRO ao atualizar a planilha: {e}")
+        logging.error(f"Falha ao atualizar a planilha do Google Sheets: {e}")
+        return False
 
-def process_files():
-    xml_files = find_xml_files(SOURCE_DIR)
-    total_files = len(xml_files)
 
-    if total_files == 0:
-        print("Nenhum arquivo XML encontrado para processar.")
+def move_file_to_destination(xml_file: Path, info: dict):
+    try:
+        destination_path = (
+            DESTINATION_NETWORK_DIRECTORY /
+            f"{info['empresa']} - {info['cnpj']}" /
+            info['tipo_documento'] /
+            info['ano_emissao'] /
+            info['mes_ano_emissao'] /
+            info['dia_emissao']
+        )
+        
+        destination_path.mkdir(parents=True, exist_ok=True)
+
+        shutil.move(str(xml_file), str(destination_path / xml_file.name))
+        logging.info(f"Arquivo '{xml_file.name}' movido para '{destination_path}'.")
+        return True
+
+    except Exception as e:
+        logging.error(f"Falha ao mover o arquivo '{xml_file.name}': {e}")
+        return False
+
+def main():
+    
+    logging.info("--- INICIANDO SCRIPT DE ORGANIZAÇÃO DE XML ---")
+    
+    if not SOURCE_DIRECTORY.exists():
+        logging.critical(f"O diretório de origem '{SOURCE_DIRECTORY}' não foi encontrado. Abortando.")
         return
 
-    print(f"Encontrados {total_files} arquivos .xml para processar.")
+    xml_files = list(SOURCE_DIRECTORY.rglob("*.xml"))
     
-    for i, xml_path in enumerate(xml_files):
-        filename = os.path.basename(xml_path)
-        print(f"\n[{i+1}/{total_files}] Processando: {filename}")
+    if not xml_files:
+        logging.info("Nenhum arquivo .xml encontrado no diretório de origem.")
+        return
+
+    logging.info(f"Encontrados {len(xml_files)} arquivos .xml para processar.")
+    
+    processed_count = 0
+    error_count = 0
+
+    for xml_file in xml_files:
+        logging.info(f"Processando arquivo: {xml_file}...")
         
-        data, error_msg = parse_xml_data(xml_path)
+        # 1. Extrair informações do XML
+        info = get_xml_info(xml_file)
+        if not info:
+            error_count += 1
+            
+            continue
+            
+        # 2. Registrar na planilha
+        if not update_google_sheet(info):
+            error_count += 1
+            logging.warning(f"Não foi possível registrar o arquivo '{xml_file.name}' na planilha. O arquivo NÃO será movido.")
+            continue
+            
+        # 3. Mover o arquivo
+        if not move_file_to_destination(xml_file, info):
+            error_count += 1
+            logging.error(f"O arquivo '{xml_file.name}' foi registrado na planilha, mas FALHOU ao ser movido.")
+            continue
+            
+        processed_count += 1
 
-        if data:
-            try:
-                company_folder_name = sanitize_filename(f"{data['razao_social']} - {data['cnpj']}")
-                
-                data_emissao_dt = datetime.strptime(data['data_emissao'], '%Y-%m-%d')
-                ano = data_emissao_dt.strftime('%Y')
-                mes_ano = data_emissao_dt.strftime('%m-%Y')
-                data_str = data_emissao_dt.strftime('%d-%m-%Y')
+    logging.info("--- SCRIPT FINALIZADO ---")
+    logging.info(f"Resumo: {processed_count} arquivos processados com sucesso, {error_count} arquivos com erro.")
 
-                final_path = os.path.join(DEST_DIR, company_folder_name, data['doc_type'], ano, mes_ano, data_str)
-                os.makedirs(final_path, exist_ok=True)
-                
-                dest_file_path = os.path.join(final_path, filename)
-                shutil.move(xml_path, dest_file_path)
-                
-                print(f"-> Sucesso! Movido para: {dest_file_path}")
-                log_to_db({**data, "filename": filename, "dest_path": dest_file_path, "status": "SUCCESS"})
-
-            except Exception as e:
-                print(f"-> ERRO ao mover o arquivo: {e}")
-                log_to_db({"razao_social": "ERRO", "cnpj": "ERRO", "filename": filename, "dest_path": "", "status": f"ERROR_MOVE: {e}"})
-        else:
-            print(f"-> Falha ao ler os dados do XML: {error_msg}. O arquivo será ignorado.")
-            log_to_db({"razao_social": "ERRO", "cnpj": "ERRO", "filename": filename, "dest_path": "", "status": f"ERROR_PARSE: {error_msg}"})
 
 if __name__ == "__main__":
-    print("--- Iniciando Organizador de XMLs ---")
-    init_db()
-    
-    while True:
-        print(f"\n--- {datetime.now().strftime('%d/%m/%Y %H:%M:%S')} ---")
-        process_files()
-        update_google_sheet()
-        print(f"--- Ciclo concluído. Aguardando {SLEEP_INTERVAL_SECONDS} segundos para a próxima verificação. ---")
-        time.sleep(SLEEP_INTERVAL_SECONDS)
+    main()

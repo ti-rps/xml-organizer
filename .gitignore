@@ -1,9 +1,25 @@
-# .gitignore
-
-# Ignorar credenciais do Google
+# Arquivos de Credenciais e Configurações Sensíveis
 credentials.json
+.env
 
-# Ignorar arquivos de ambiente Python
-venv/
+# Logs e Arquivos de Saída
+*.log
+logs/
+
+# Cache e Arquivos Compilados do Python
 __pycache__/
 *.pyc
+*.pyo
+*.pyd
+
+# Ambiente Virtual
+venv/
+.venv/
+
+# Arquivos de Configuração de IDEs
+.vscode/
+.idea/
+
+# Arquivos de Metadados de Sistema Operacional
+.DS_Store
+Thumbs.db
