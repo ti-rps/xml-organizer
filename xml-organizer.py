@@ -3,15 +3,18 @@ import shutil
 import xml.etree.ElementTree as ET
 from pathlib import Path
 from datetime import datetime
-import pandas as pd
-import gspread
-from oauth2client.service_account import ServiceAccountCredentials
 import logging
+import sqlite3
+import re
 
+# Para WSL:
 SOURCE_DIRECTORY = Path("/mnt/c/Automations")
 DESTINATION_NETWORK_DIRECTORY = Path("/mnt/r/XML_ASINCRONIZAR/ZZZ_XML_BOT")
-GOOGLE_SHEET_NAME = "HIST. XML BOTS"
-CREDENTIALS_FILE = "credentials.json"
+DATABASE_FILE = "xml_organizer.db"
+
+# Para Windows:
+# SOURCE_DIRECTORY = Path(r"C:\Automations")
+# DESTINATION_NETWORK_DIRECTORY = Path(r"R:\XML_ASINCRONIZAR\ZZZ_XML_BOT")
 
 logging.basicConfig(
     level=logging.INFO,
@@ -21,6 +24,68 @@ logging.basicConfig(
         logging.StreamHandler()
     ]
 )
+
+def setup_database():
+    try:
+        conn = sqlite3.connect(DATABASE_FILE)
+        cursor = conn.cursor()
+        
+        cursor.execute('''
+        CREATE TABLE IF NOT EXISTS EMPRESAS (
+            ID_EMPRESA INTEGER PRIMARY KEY AUTOINCREMENT,
+            CNPJ_EMPRESA TEXT NOT NULL UNIQUE,
+            NOME_ORIGINAL_EMPRESA TEXT NOT NULL,
+            NOME_PADRONIZADO_EMPRESA TEXT NOT NULL
+        )
+        ''')
+
+        cursor.execute('''
+        CREATE TABLE IF NOT EXISTS NOTAS_FISCAIS (
+            ID_NF INTEGER PRIMARY KEY AUTOINCREMENT,
+            CHAVE_ACESSO_NF TEXT NOT NULL UNIQUE,
+            ID_EMPRESA INTEGER,
+            DATA_LEITURA_NF TEXT NOT NULL,
+            HORA_LEITURA_NF TEXT NOT NULL,
+            DATA_EMISSAO_NF TEXT NOT NULL,
+            TIPO_DOCUMENTO_NF TEXT NOT NULL,
+            CAMINHO_ARQUIVO_NF TEXT,
+            FOREIGN KEY (ID_EMPRESA) REFERENCES EMPRESAS (ID_EMPRESA)
+        )
+        ''')
+        
+        conn.commit()
+        conn.close()
+        logging.info("Banco de dados verificado/criado com sucesso.")
+    except Exception as e:
+        logging.critical(f"Falha ao criar ou conectar ao banco de dados: {e}")
+        raise
+
+def standardize_company_name(name: str) -> str:
+    name = re.sub(r'[.\-/]', '', name)
+    name = re.sub(r'\s+', ' ', name).strip()
+    return name.upper()
+
+def get_or_create_company(cnpj: str, nome_original: str) -> int:
+    conn = sqlite3.connect(DATABASE_FILE)
+    cursor = conn.cursor()
+    
+    cursor.execute("SELECT ID_EMPRESA FROM EMPRESAS WHERE CNPJ_EMPRESA = ?", (cnpj,))
+    result = cursor.fetchone()
+    
+    if result:
+        company_id = result[0]
+    else:
+        nome_padronizado = standardize_company_name(nome_original)
+        cursor.execute(
+            "INSERT INTO EMPRESAS (CNPJ_EMPRESA, NOME_ORIGINAL_EMPRESA, NOME_PADRONIZADO_EMPRESA) VALUES (?, ?, ?)",
+            (cnpj, nome_original, nome_padronizado)
+        )
+        conn.commit()
+        company_id = cursor.lastrowid
+        logging.info(f"Nova empresa registrada: '{nome_padronizado}' (CNPJ: {cnpj})")
+        
+    conn.close()
+    return company_id
 
 def get_xml_info(xml_file: Path) -> dict:
     ns = {'nfe': 'http://www.portalfiscal.inf.br/nfe'}
@@ -56,14 +121,16 @@ def get_xml_info(xml_file: Path) -> dict:
             tipo_documento = f"Modelo_{modelo}"
 
         cnpj = emit.find('nfe:CNPJ', ns).text
-        nome_empresa = emit.find('nfe:xNome', ns).text
+        nome_empresa_original = emit.find('nfe:xNome', ns).text
+        nome_empresa_padronizado = standardize_company_name(nome_empresa_original)
 
         return {
             "data_leitura": datetime.now().strftime('%Y-%m-%d'),
             "hora_leitura": datetime.now().strftime('%H:%M:%S'),
             "data_emissao": data_emissao_dt.strftime('%Y-%m-%d'),
             "chave_acesso": chave_acesso,
-            "empresa": nome_empresa,
+            "empresa_original": nome_empresa_original,
+            "empresa_padronizada": nome_empresa_padronizado,
             "cnpj": cnpj,
             "tipo_documento": tipo_documento,
             "ano_emissao": data_emissao_dt.strftime('%Y'),
@@ -79,32 +146,42 @@ def get_xml_info(xml_file: Path) -> dict:
         return None
 
 
-def update_google_sheet(data: dict):
+def register_invoice_in_db(data: dict, file_path: str) -> bool:
     try:
-        scope = ["https://spreadsheets.google.com/feeds", 'https://www.googleapis.com/auth/spreadsheets',
-                 "https://www.googleapis.com/auth/drive.file", "https://www.googleapis.com/auth/drive"]
+        company_id = get_or_create_company(data["cnpj"], data["empresa_original"])
         
-        creds = ServiceAccountCredentials.from_json_keyfile_name(CREDENTIALS_FILE, scope)
-        client = gspread.authorize(creds)
-        
-        sheet = client.open(GOOGLE_SHEET_NAME).sheet1
-        
-        df_row = pd.DataFrame([{
-            "Data Leitura": data["data_leitura"],
-            "Hora Leitura": data["hora_leitura"],
-            "Data Emissão": data["data_emissao"],
-            "Chave Acesso": data["chave_acesso"],
-            "Empresa": data["empresa"],
-            "CNPJ": data["cnpj"],
-            "Tipo Documento": data["tipo_documento"]
-        }])
+        conn = sqlite3.connect(DATABASE_FILE)
+        cursor = conn.cursor()
 
-        sheet.append_rows(df_row.values.tolist(), value_input_option='USER_ENTERED')
-        logging.info(f"Dados da nota {data['chave_acesso']} registrados na planilha.")
+        cursor.execute("SELECT ID_NF FROM NOTAS_FISCAIS WHERE CHAVE_ACESSO_NF = ?", (data["chave_acesso"],))
+        if cursor.fetchone():
+            logging.warning(f"Nota fiscal com chave de acesso {data['chave_acesso']} já registrada no banco de dados.")
+            conn.close()
+            return False
+
+        cursor.execute(
+            '''
+            INSERT INTO NOTAS_FISCAIS (CHAVE_ACESSO_NF, ID_EMPRESA, DATA_LEITURA_NF, HORA_LEITURA_NF, DATA_EMISSAO_NF, TIPO_DOCUMENTO_NF, CAMINHO_ARQUIVO_NF)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            ''',
+            (
+                data["chave_acesso"],
+                company_id,
+                data["data_leitura"],
+                data["hora_leitura"],
+                data["data_emissao"],
+                data["tipo_documento"],
+                file_path
+            )
+        )
+        
+        conn.commit()
+        conn.close()
+        logging.info(f"Dados da nota {data['chave_acesso']} registrados no banco de dados.")
         return True
 
     except Exception as e:
-        logging.error(f"Falha ao atualizar a planilha do Google Sheets: {e}")
+        logging.error(f"Falha ao registrar a nota no banco de dados: {e}")
         return False
 
 
@@ -112,7 +189,7 @@ def move_file_to_destination(xml_file: Path, info: dict):
     try:
         destination_path = (
             DESTINATION_NETWORK_DIRECTORY /
-            f"{info['empresa']} - {info['cnpj']}" /
+            f"{info['empresa_padronizada']} - {info['cnpj']}" /
             info['tipo_documento'] /
             info['ano_emissao'] /
             info['mes_ano_emissao'] /
@@ -120,8 +197,16 @@ def move_file_to_destination(xml_file: Path, info: dict):
         )
         
         destination_path.mkdir(parents=True, exist_ok=True)
+        
+        destination_file_path = destination_path / xml_file.name
+        shutil.move(str(xml_file), str(destination_file_path))
 
-        shutil.move(str(xml_file), str(destination_path / xml_file.name))
+        conn = sqlite3.connect(DATABASE_FILE)
+        cursor = conn.cursor()
+        cursor.execute("UPDATE NOTAS_FISCAIS SET CAMINHO_ARQUIVO_NF = ? WHERE CHAVE_ACESSO_NF = ?", (str(destination_file_path), info['chave_acesso']))
+        conn.commit()
+        conn.close()
+
         logging.info(f"Arquivo '{xml_file.name}' movido para '{destination_path}'.")
         return True
 
@@ -133,6 +218,8 @@ def main():
     
     logging.info("--- INICIANDO SCRIPT DE ORGANIZAÇÃO DE XML ---")
     
+    setup_database()
+
     if not SOURCE_DIRECTORY.exists():
         logging.critical(f"O diretório de origem '{SOURCE_DIRECTORY}' não foi encontrado. Abortando.")
         return
@@ -151,29 +238,24 @@ def main():
     for xml_file in xml_files:
         logging.info(f"Processando arquivo: {xml_file}...")
         
-        # 1. Extrair informações do XML
         info = get_xml_info(xml_file)
         if not info:
             error_count += 1
-            
             continue
             
-        # 2. Registrar na planilha
-        if not update_google_sheet(info):
-            error_count += 1
-            logging.warning(f"Não foi possível registrar o arquivo '{xml_file.name}' na planilha. O arquivo NÃO será movido.")
+        if not register_invoice_in_db(info, str(xml_file)):
+            logging.info(f"Arquivo '{xml_file.name}' já processado anteriormente. Pulando.")
             continue
             
-        # 3. Mover o arquivo
         if not move_file_to_destination(xml_file, info):
             error_count += 1
-            logging.error(f"O arquivo '{xml_file.name}' foi registrado na planilha, mas FALHOU ao ser movido.")
+            logging.error(f"O arquivo '{xml_file.name}' foi registrado no banco, mas FALHOU ao ser movido.")
             continue
             
         processed_count += 1
 
     logging.info("--- SCRIPT FINALIZADO ---")
-    logging.info(f"Resumo: {processed_count} arquivos processados com sucesso, {error_count} arquivos com erro.")
+    logging.info(f"Resumo: {processed_count} arquivos novos processados com sucesso, {error_count} arquivos com erro.")
 
 
 if __name__ == "__main__":
