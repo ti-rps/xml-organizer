@@ -6,26 +6,49 @@ from datetime import datetime
 import logging
 import sqlite3
 import re
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from threading import Lock
+import hashlib
 
-# Para WSL:
+# ==================== CONFIGURAÇÕES ====================
+# Para WSL
 SOURCE_DIRECTORY = Path("/mnt/c/Automations")
 DESTINATION_NETWORK_DIRECTORY = Path("/mnt/r/XML_ASINCRONIZAR/ZZZ_XML_BOT")
-DATABASE_FILE = "xml_organizer.db"
+ERROR_DIRECTORY = DESTINATION_NETWORK_DIRECTORY / "_ERROS"
 
-# Para Windows:
+# Banco de dados no disco C: (acessível de qualquer ambiente)
+DATABASE_FILE = "/mnt/c/xml_organizer_data/xml_organizer.db"
+LOG_FILE = "/mnt/c/xml_organizer_data/xml_organizer.log"
+
+# Para Windows (descomente se for usar no Windows)
 # SOURCE_DIRECTORY = Path(r"C:\Automations")
 # DESTINATION_NETWORK_DIRECTORY = Path(r"R:\XML_ASINCRONIZAR\ZZZ_XML_BOT")
+# ERROR_DIRECTORY = DESTINATION_NETWORK_DIRECTORY / "_ERROS"
+# DATABASE_FILE = r"C:\xml_organizer_data\xml_organizer.db"
+# LOG_FILE = r"C:\xml_organizer_data\xml_organizer.log"
+
+# Parâmetros de desempenho
+MAX_WORKERS = 4  # Número de threads paralelas
+SCAN_INTERVAL = 30  # Intervalo em segundos entre verificações
+BATCH_SIZE = 50  # Processa arquivos em lotes
+
+os.makedirs(os.path.dirname(DATABASE_FILE), exist_ok=True)
 
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
+    format='%(asctime)s [%(levelname)s] %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S',
     handlers=[
-        logging.FileHandler("xml_organizer.log"),
+        logging.FileHandler(LOG_FILE, encoding='utf-8'),
         logging.StreamHandler()
     ]
 )
 
+db_lock = Lock()
+
 def setup_database():
+    """Cria o banco de dados e tabelas se não existirem"""
     try:
         conn = sqlite3.connect(DATABASE_FILE)
         cursor = conn.cursor()
@@ -35,7 +58,8 @@ def setup_database():
             ID_EMPRESA INTEGER PRIMARY KEY AUTOINCREMENT,
             CNPJ_EMPRESA TEXT NOT NULL UNIQUE,
             NOME_ORIGINAL_EMPRESA TEXT NOT NULL,
-            NOME_PADRONIZADO_EMPRESA TEXT NOT NULL
+            NOME_PADRONIZADO_EMPRESA TEXT NOT NULL,
+            CREATED_AT TEXT DEFAULT CURRENT_TIMESTAMP
         )
         ''')
 
@@ -43,94 +67,150 @@ def setup_database():
         CREATE TABLE IF NOT EXISTS NOTAS_FISCAIS (
             ID_NF INTEGER PRIMARY KEY AUTOINCREMENT,
             CHAVE_ACESSO_NF TEXT NOT NULL UNIQUE,
+            HASH_ARQUIVO TEXT NOT NULL,
             ID_EMPRESA INTEGER,
             DATA_LEITURA_NF TEXT NOT NULL,
-            HORA_LEITURA_NF TEXT NOT NULL,
             DATA_EMISSAO_NF TEXT NOT NULL,
             TIPO_DOCUMENTO_NF TEXT NOT NULL,
             CAMINHO_ARQUIVO_NF TEXT,
+            STATUS TEXT DEFAULT 'PROCESSADO',
+            CREATED_AT TEXT DEFAULT CURRENT_TIMESTAMP,
             FOREIGN KEY (ID_EMPRESA) REFERENCES EMPRESAS (ID_EMPRESA)
         )
         ''')
         
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_chave_acesso ON NOTAS_FISCAIS(CHAVE_ACESSO_NF)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_hash ON NOTAS_FISCAIS(HASH_ARQUIVO)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_cnpj ON EMPRESAS(CNPJ_EMPRESA)')
+        
         conn.commit()
         conn.close()
-        logging.info("Banco de dados verificado/criado com sucesso.")
+        logging.info("✓ Banco de dados inicializado")
     except Exception as e:
-        logging.critical(f"Falha ao criar ou conectar ao banco de dados: {e}")
+        logging.critical(f"✗ Falha ao inicializar banco: {e}")
         raise
 
+def calculate_file_hash(file_path: Path) -> str:
+    hash_md5 = hashlib.md5()
+    with open(file_path, "rb") as f:
+        for chunk in iter(lambda: f.read(4096), b""):
+            hash_md5.update(chunk)
+    return hash_md5.hexdigest()
+
 def standardize_company_name(name: str) -> str:
-    name = re.sub(r'[.\-/]', '', name)
+    name = re.sub(r'[.\-/\\]', '', name)
     name = re.sub(r'\s+', ' ', name).strip()
     return name.upper()
 
 def get_or_create_company(cnpj: str, nome_original: str) -> int:
-    conn = sqlite3.connect(DATABASE_FILE)
-    cursor = conn.cursor()
-    
-    cursor.execute("SELECT ID_EMPRESA FROM EMPRESAS WHERE CNPJ_EMPRESA = ?", (cnpj,))
-    result = cursor.fetchone()
-    
-    if result:
-        company_id = result[0]
-    else:
-        nome_padronizado = standardize_company_name(nome_original)
-        cursor.execute(
-            "INSERT INTO EMPRESAS (CNPJ_EMPRESA, NOME_ORIGINAL_EMPRESA, NOME_PADRONIZADO_EMPRESA) VALUES (?, ?, ?)",
-            (cnpj, nome_original, nome_padronizado)
-        )
-        conn.commit()
-        company_id = cursor.lastrowid
-        logging.info(f"Nova empresa registrada: '{nome_padronizado}' (CNPJ: {cnpj})")
+    with db_lock:
+        conn = sqlite3.connect(DATABASE_FILE, timeout=10)
+        cursor = conn.cursor()
         
-    conn.close()
-    return company_id
+        cursor.execute("SELECT ID_EMPRESA FROM EMPRESAS WHERE CNPJ_EMPRESA = ?", (cnpj,))
+        result = cursor.fetchone()
+        
+        if result:
+            company_id = result[0]
+        else:
+            nome_padronizado = standardize_company_name(nome_original)
+            cursor.execute(
+                "INSERT INTO EMPRESAS (CNPJ_EMPRESA, NOME_ORIGINAL_EMPRESA, NOME_PADRONIZADO_EMPRESA) VALUES (?, ?, ?)",
+                (cnpj, nome_original, nome_padronizado)
+            )
+            conn.commit()
+            company_id = cursor.lastrowid
+            
+        conn.close()
+        return company_id
 
 def get_xml_info(xml_file: Path) -> dict:
-    ns = {'nfe': 'http://www.portalfiscal.inf.br/nfe'}
+    namespaces = [
+        {'nfe': 'http://www.portalfiscal.inf.br/nfe'},
+        {},
+    ]
+    
     try:
         tree = ET.parse(xml_file)
         root = tree.getroot()
 
-        infNFe = root.find('.//nfe:infNFe', ns)
+        infNFe = None
+        for ns in namespaces:
+            infNFe = root.find('.//nfe:infNFe', ns) if ns else root.find('.//infNFe')
+            if infNFe is not None:
+                break
+        
         if infNFe is None:
-            logging.warning(f"Arquivo '{xml_file.name}' não é uma NF-e/NFC-e válida (tag 'infNFe' não encontrada).")
+            for elem in root.iter():
+                if elem.tag.endswith('infNFe'):
+                    infNFe = elem
+                    break
+        
+        if infNFe is None:
             return None
 
-        chave_acesso = infNFe.get('Id', '')[3:]
+        chave_acesso = infNFe.get('Id', '').replace('NFe', '').replace('nfe', '')
 
-        ide = infNFe.find('nfe:ide', ns)
-        emit = infNFe.find('nfe:emit', ns)
+        ide = None
+        emit = None
+        for ns in namespaces:
+            if ns:
+                ide = infNFe.find('nfe:ide', ns)
+                emit = infNFe.find('nfe:emit', ns)
+            else:
+                ide = infNFe.find('ide')
+                emit = infNFe.find('emit')
+            if ide is not None and emit is not None:
+                break
 
         if ide is None or emit is None:
-            logging.warning(f"Arquivo '{xml_file.name}' não possui as tags 'ide' ou 'emit'.")
             return None
 
-        dhEmi_element = ide.find('nfe:dhEmi', ns)
-        data_emissao_str = dhEmi_element.text.split('T')[0] if dhEmi_element is not None else ''
+        data_emissao_str = None
+        for tag_name in ['dhEmi', 'dEmi']:
+            for ns in namespaces:
+                elem = ide.find(f'nfe:{tag_name}', ns) if ns else ide.find(tag_name)
+                if elem is not None:
+                    data_emissao_str = elem.text.split('T')[0] if 'T' in elem.text else elem.text
+                    break
+            if data_emissao_str:
+                break
+        
+        if not data_emissao_str:
+            return None
+            
         data_emissao_dt = datetime.strptime(data_emissao_str, '%Y-%m-%d')
 
-        mod_element = ide.find('nfe:mod', ns)
-        modelo = mod_element.text if mod_element is not None else ''
-        if modelo == '55':
-            tipo_documento = 'NFE'
-        elif modelo == '65':
-            tipo_documento = 'NFCE'
-        else:
-            tipo_documento = f"Modelo_{modelo}"
+        modelo = None
+        for ns in namespaces:
+            mod_elem = ide.find('nfe:mod', ns) if ns else ide.find('mod')
+            if mod_elem is not None:
+                modelo = mod_elem.text
+                break
+        
+        tipo_documento = 'NFE' if modelo == '55' else 'NFCE' if modelo == '65' else f"MOD{modelo}"
 
-        cnpj = emit.find('nfe:CNPJ', ns).text
-        nome_empresa_original = emit.find('nfe:xNome', ns).text
-        nome_empresa_padronizado = standardize_company_name(nome_empresa_original)
+        cnpj = None
+        nome_empresa = None
+        for ns in namespaces:
+            cnpj_elem = emit.find('nfe:CNPJ', ns) if ns else emit.find('CNPJ')
+            nome_elem = emit.find('nfe:xNome', ns) if ns else emit.find('xNome')
+            if cnpj_elem is not None:
+                cnpj = cnpj_elem.text
+            if nome_elem is not None:
+                nome_empresa = nome_elem.text
+            if cnpj and nome_empresa:
+                break
+
+        if not cnpj or not nome_empresa:
+            return None
 
         return {
             "data_leitura": datetime.now().strftime('%Y-%m-%d'),
-            "hora_leitura": datetime.now().strftime('%H:%M:%S'),
             "data_emissao": data_emissao_dt.strftime('%Y-%m-%d'),
             "chave_acesso": chave_acesso,
-            "empresa_original": nome_empresa_original,
-            "empresa_padronizada": nome_empresa_padronizado,
+            "empresa_original": nome_empresa,
+            "empresa_padronizada": standardize_company_name(nome_empresa),
             "cnpj": cnpj,
             "tipo_documento": tipo_documento,
             "ano_emissao": data_emissao_dt.strftime('%Y'),
@@ -138,54 +218,43 @@ def get_xml_info(xml_file: Path) -> dict:
             "dia_emissao": data_emissao_dt.strftime('%d')
         }
 
-    except ET.ParseError:
-        logging.error(f"Erro de parsing no XML '{xml_file.name}'. O arquivo pode estar corrompido.")
-        return None
     except Exception as e:
-        logging.error(f"Erro inesperado ao processar o arquivo '{xml_file.name}': {e}")
+        logging.debug(f"Erro ao processar {xml_file.name}: {e}")
         return None
 
-
-def register_invoice_in_db(data: dict, file_path: str) -> bool:
+def register_invoice_in_db(data: dict, file_path: str, file_hash: str) -> bool:
     try:
-        company_id = get_or_create_company(data["cnpj"], data["empresa_original"])
-        
-        conn = sqlite3.connect(DATABASE_FILE)
-        cursor = conn.cursor()
+        with db_lock:
+            conn = sqlite3.connect(DATABASE_FILE, timeout=10)
+            cursor = conn.cursor()
 
-        cursor.execute("SELECT ID_NF FROM NOTAS_FISCAIS WHERE CHAVE_ACESSO_NF = ?", (data["chave_acesso"],))
-        if cursor.fetchone():
-            logging.warning(f"Nota fiscal com chave de acesso {data['chave_acesso']} já registrada no banco de dados.")
-            conn.close()
-            return False
-
-        cursor.execute(
-            '''
-            INSERT INTO NOTAS_FISCAIS (CHAVE_ACESSO_NF, ID_EMPRESA, DATA_LEITURA_NF, HORA_LEITURA_NF, DATA_EMISSAO_NF, TIPO_DOCUMENTO_NF, CAMINHO_ARQUIVO_NF)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-            ''',
-            (
-                data["chave_acesso"],
-                company_id,
-                data["data_leitura"],
-                data["hora_leitura"],
-                data["data_emissao"],
-                data["tipo_documento"],
-                file_path
+            cursor.execute(
+                "SELECT ID_NF FROM NOTAS_FISCAIS WHERE CHAVE_ACESSO_NF = ? OR HASH_ARQUIVO = ?", 
+                (data["chave_acesso"], file_hash)
             )
-        )
-        
-        conn.commit()
-        conn.close()
-        logging.info(f"Dados da nota {data['chave_acesso']} registrados no banco de dados.")
-        return True
+            if cursor.fetchone():
+                conn.close()
+                return False
+
+            company_id = get_or_create_company(data["cnpj"], data["empresa_original"])
+
+            cursor.execute(
+                '''INSERT INTO NOTAS_FISCAIS 
+                (CHAVE_ACESSO_NF, HASH_ARQUIVO, ID_EMPRESA, DATA_LEITURA_NF, DATA_EMISSAO_NF, TIPO_DOCUMENTO_NF, CAMINHO_ARQUIVO_NF)
+                VALUES (?, ?, ?, ?, ?, ?, ?)''',
+                (data["chave_acesso"], file_hash, company_id, data["data_leitura"], 
+                 data["data_emissao"], data["tipo_documento"], file_path)
+            )
+            
+            conn.commit()
+            conn.close()
+            return True
 
     except Exception as e:
-        logging.error(f"Falha ao registrar a nota no banco de dados: {e}")
+        logging.error(f"Erro ao registrar no banco: {e}")
         return False
 
-
-def move_file_to_destination(xml_file: Path, info: dict):
+def move_file_to_destination(xml_file: Path, info: dict) -> bool:
     try:
         destination_path = (
             DESTINATION_NETWORK_DIRECTORY /
@@ -197,66 +266,131 @@ def move_file_to_destination(xml_file: Path, info: dict):
         )
         
         destination_path.mkdir(parents=True, exist_ok=True)
+        destination_file = destination_path / xml_file.name
         
-        destination_file_path = destination_path / xml_file.name
-        shutil.move(str(xml_file), str(destination_file_path))
+        shutil.move(str(xml_file), str(destination_file))
+        
+        with db_lock:
+            conn = sqlite3.connect(DATABASE_FILE, timeout=10)
+            cursor = conn.cursor()
+            cursor.execute(
+                "UPDATE NOTAS_FISCAIS SET CAMINHO_ARQUIVO_NF = ? WHERE CHAVE_ACESSO_NF = ?", 
+                (str(destination_file), info['chave_acesso'])
+            )
+            conn.commit()
+            conn.close()
 
-        conn = sqlite3.connect(DATABASE_FILE)
-        cursor = conn.cursor()
-        cursor.execute("UPDATE NOTAS_FISCAIS SET CAMINHO_ARQUIVO_NF = ? WHERE CHAVE_ACESSO_NF = ?", (str(destination_file_path), info['chave_acesso']))
-        conn.commit()
-        conn.close()
-
-        logging.info(f"Arquivo '{xml_file.name}' movido para '{destination_path}'.")
         return True
 
     except Exception as e:
-        logging.error(f"Falha ao mover o arquivo '{xml_file.name}': {e}")
+        logging.error(f"Erro ao mover {xml_file.name}: {e}")
         return False
 
-def main():
-    
-    logging.info("--- INICIANDO SCRIPT DE ORGANIZAÇÃO DE XML ---")
-    
-    setup_database()
+def move_to_error_folder(xml_file: Path, reason: str = "erro_processamento"):
+    try:
+        ERROR_DIRECTORY.mkdir(parents=True, exist_ok=True)
+        error_subdir = ERROR_DIRECTORY / reason
+        error_subdir.mkdir(exist_ok=True)
+        
+        destination = error_subdir / xml_file.name
+        shutil.move(str(xml_file), str(destination))
+        
+    except Exception as e:
+        logging.error(f"Erro ao mover arquivo para pasta de erros: {e}")
 
-    if not SOURCE_DIRECTORY.exists():
-        logging.critical(f"O diretório de origem '{SOURCE_DIRECTORY}' não foi encontrado. Abortando.")
-        return
-
-    xml_files = list(SOURCE_DIRECTORY.rglob("*.xml"))
+def process_single_file(xml_file: Path) -> dict:
+    result = {"file": xml_file.name, "status": "erro", "reason": ""}
     
-    if not xml_files:
-        logging.info("Nenhum arquivo .xml encontrado no diretório de origem.")
-        return
-
-    logging.info(f"Encontrados {len(xml_files)} arquivos .xml para processar.")
-    
-    processed_count = 0
-    error_count = 0
-
-    for xml_file in xml_files:
-        logging.info(f"Processando arquivo: {xml_file}...")
+    try:
+        file_hash = calculate_file_hash(xml_file)
         
         info = get_xml_info(xml_file)
         if not info:
-            error_count += 1
-            continue
-            
-        if not register_invoice_in_db(info, str(xml_file)):
-            logging.info(f"Arquivo '{xml_file.name}' já processado anteriormente. Pulando.")
-            continue
-            
-        if not move_file_to_destination(xml_file, info):
-            error_count += 1
-            logging.error(f"O arquivo '{xml_file.name}' foi registrado no banco, mas FALHOU ao ser movido.")
-            continue
-            
-        processed_count += 1
+            result["reason"] = "xml_invalido"
+            move_to_error_folder(xml_file, "xml_invalido")
+            return result
+        
+        if not register_invoice_in_db(info, str(xml_file), file_hash):
+            result["status"] = "duplicado"
+            xml_file.unlink()
+            return result
+        
+        if move_file_to_destination(xml_file, info):
+            result["status"] = "sucesso"
+        else:
+            result["reason"] = "erro_mover"
+            move_to_error_folder(xml_file, "erro_movimentacao")
+    
+    except Exception as e:
+        result["reason"] = f"exception: {str(e)[:50]}"
+        move_to_error_folder(xml_file, "erro_geral")
+    
+    return result
 
-    logging.info("--- SCRIPT FINALIZADO ---")
-    logging.info(f"Resumo: {processed_count} arquivos novos processados com sucesso, {error_count} arquivos com erro.")
+def process_batch(xml_files: list) -> dict:
+    stats = {"sucesso": 0, "duplicado": 0, "erro": 0}
+    
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        futures = {executor.submit(process_single_file, f): f for f in xml_files}
+        
+        for future in as_completed(futures):
+            result = future.result()
+            if result["status"] == "sucesso":
+                stats["sucesso"] += 1
+            elif result["status"] == "duplicado":
+                stats["duplicado"] += 1
+            else:
+                stats["erro"] += 1
+    
+    return stats
 
+def scan_and_process():
+    if not SOURCE_DIRECTORY.exists():
+        logging.error(f"Diretório de origem não encontrado: {SOURCE_DIRECTORY}")
+        return
+    
+    xml_files = list(SOURCE_DIRECTORY.rglob("*.xml"))
+    
+    if not xml_files:
+        return
+    
+    total = len(xml_files)
+    logging.info(f"→ {total} arquivo(s) encontrado(s)")
+    
+    for i in range(0, total, BATCH_SIZE):
+        batch = xml_files[i:i+BATCH_SIZE]
+        stats = process_batch(batch)
+        
+        if any(stats.values()):
+            logging.info(
+                f"✓ Lote {i//BATCH_SIZE + 1}: "
+                f"{stats['sucesso']} ok | {stats['duplicado']} dup | {stats['erro']} erro"
+            )
+
+def main():
+    logging.info("="*60)
+    logging.info("XML ORGANIZER v2.0 - INICIANDO")
+    logging.info(f"Monitorando: {SOURCE_DIRECTORY}")
+    logging.info(f"Destino: {DESTINATION_NETWORK_DIRECTORY}")
+    logging.info(f"Banco de dados: {DATABASE_FILE}")
+    logging.info(f"Intervalo de verificação: {SCAN_INTERVAL}s")
+    logging.info("="*60)
+    
+    setup_database()
+    
+    cycle = 0
+    while True:
+        try:
+            cycle += 1
+            scan_and_process()
+            time.sleep(SCAN_INTERVAL)
+            
+        except KeyboardInterrupt:
+            logging.info("\n⊗ Finalizando por solicitação do usuário")
+            break
+        except Exception as e:
+            logging.error(f"✗ Erro no ciclo {cycle}: {e}")
+            time.sleep(10)
 
 if __name__ == "__main__":
     main()
