@@ -1,25 +1,70 @@
-# Arquivos de Credenciais e Configurações Sensíveis
+# Arquivos de Credenciais e Configurações Sensíveis (legado)
 credentials.json
 .env
 
-# Logs e Arquivos de Saída
+# Banco de Dados e Logs
+*.db
+*.db-journal
 *.log
-logs/
+xml_organizer_data/
+
+# Arquivos de Backup
+*.backup
+*.bak
+*.old
+
+# Arquivos Temporários
+*.tmp
+*.temp
+test_write.tmp
+
+# Arquivos de Teste
+historico_v1.csv
+relatorio_*.xlsx
+relatorio_*.csv
+relatorio_*.txt
 
 # Cache e Arquivos Compilados do Python
 __pycache__/
 *.pyc
 *.pyo
 *.pyd
+*.so
 
 # Ambiente Virtual
 venv/
 .venv/
+env/
+ENV/
 
 # Arquivos de Configuração de IDEs
 .vscode/
 .idea/
+*.swp
+*.swo
+*~
 
 # Arquivos de Metadados de Sistema Operacional
 .DS_Store
 Thumbs.db
+desktop.ini
+
+# Arquivos do NSSM (Windows)
+nssm.exe
+nssm_*.log
+
+# Arquivos de Distribuição
+dist/
+build/
+*.egg-info/
+
+# Jupyter Notebooks
+.ipynb_checkpoints/
+*.ipynb
+
+# Pytest
+.pytest_cache/
+.coverage
+
+# MyPy
+.mypy_cache/
