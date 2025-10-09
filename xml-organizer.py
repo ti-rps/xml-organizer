@@ -11,7 +11,6 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from threading import Lock
 import hashlib
 
-# ==================== CONFIGURAÇÕES ====================
 # Para WSL
 SOURCE_DIRECTORY = Path("/mnt/c/Automations")
 DESTINATION_NETWORK_DIRECTORY = Path("/mnt/r/XML_ASINCRONIZAR/ZZZ_XML_BOT")
@@ -28,10 +27,10 @@ LOG_FILE = "/mnt/c/xml_organizer_data/xml_organizer.log"
 # DATABASE_FILE = r"C:\xml_organizer_data\xml_organizer.db"
 # LOG_FILE = r"C:\xml_organizer_data\xml_organizer.log"
 
-# Parâmetros de desempenho
-MAX_WORKERS = 4  # Número de threads paralelas
-SCAN_INTERVAL = 30  # Intervalo em segundos entre verificações
-BATCH_SIZE = 50  # Processa arquivos em lotes
+MAX_WORKERS = 8
+SCAN_INTERVAL = 30
+BATCH_SIZE = 200
+BATCH_INSERT_SIZE = 50
 
 os.makedirs(os.path.dirname(DATABASE_FILE), exist_ok=True)
 
@@ -46,6 +45,11 @@ logging.basicConfig(
 )
 
 db_lock = Lock()
+
+company_cache = {}
+cache_lock = Lock()
+
+processed_hashes = set()
 
 def setup_database():
     """Cria o banco de dados e tabelas se não existirem"""
@@ -90,39 +94,67 @@ def setup_database():
         logging.critical(f"✗ Falha ao inicializar banco: {e}")
         raise
 
+def load_caches():
+    global company_cache, processed_hashes
+    
+    try:
+        conn = sqlite3.connect(DATABASE_FILE)
+        cursor = conn.cursor()
+        
+        cursor.execute("SELECT CNPJ_EMPRESA, ID_EMPRESA, NOME_PADRONIZADO_EMPRESA FROM EMPRESAS")
+        for cnpj, id_empresa, nome in cursor.fetchall():
+            company_cache[cnpj] = {"id": id_empresa, "nome": nome}
+        
+        cursor.execute("SELECT HASH_ARQUIVO FROM NOTAS_FISCAIS")
+        processed_hashes = {row[0] for row in cursor.fetchall()}
+        
+        conn.close()
+        logging.info(f"✓ Cache carregado: {len(company_cache)} empresas, {len(processed_hashes)} hashes")
+    except Exception as e:
+        logging.error(f"Erro ao carregar cache: {e}")
+
 def calculate_file_hash(file_path: Path) -> str:
     hash_md5 = hashlib.md5()
-    with open(file_path, "rb") as f:
-        for chunk in iter(lambda: f.read(4096), b""):
-            hash_md5.update(chunk)
-    return hash_md5.hexdigest()
+    try:
+        with open(file_path, "rb") as f:
+            for chunk in iter(lambda: f.read(65536), b""):
+                hash_md5.update(chunk)
+        return hash_md5.hexdigest()
+    except:
+        return None
 
 def standardize_company_name(name: str) -> str:
     name = re.sub(r'[.\-/\\]', '', name)
     name = re.sub(r'\s+', ' ', name).strip()
     return name.upper()
 
-def get_or_create_company(cnpj: str, nome_original: str) -> int:
-    with db_lock:
-        conn = sqlite3.connect(DATABASE_FILE, timeout=10)
-        cursor = conn.cursor()
+def get_or_create_company_cached(cnpj: str, nome_original: str) -> int:
+    with cache_lock:
+        if cnpj in company_cache:
+            return company_cache[cnpj]["id"]
         
-        cursor.execute("SELECT ID_EMPRESA FROM EMPRESAS WHERE CNPJ_EMPRESA = ?", (cnpj,))
-        result = cursor.fetchone()
-        
-        if result:
-            company_id = result[0]
-        else:
-            nome_padronizado = standardize_company_name(nome_original)
-            cursor.execute(
-                "INSERT INTO EMPRESAS (CNPJ_EMPRESA, NOME_ORIGINAL_EMPRESA, NOME_PADRONIZADO_EMPRESA) VALUES (?, ?, ?)",
-                (cnpj, nome_original, nome_padronizado)
-            )
-            conn.commit()
-            company_id = cursor.lastrowid
+        with db_lock:
+            conn = sqlite3.connect(DATABASE_FILE, timeout=10)
+            cursor = conn.cursor()
             
-        conn.close()
-        return company_id
+            cursor.execute("SELECT ID_EMPRESA FROM EMPRESAS WHERE CNPJ_EMPRESA = ?", (cnpj,))
+            result = cursor.fetchone()
+            
+            if result:
+                company_id = result[0]
+            else:
+                nome_padronizado = standardize_company_name(nome_original)
+                cursor.execute(
+                    "INSERT INTO EMPRESAS (CNPJ_EMPRESA, NOME_ORIGINAL_EMPRESA, NOME_PADRONIZADO_EMPRESA) VALUES (?, ?, ?)",
+                    (cnpj, nome_original, nome_padronizado)
+                )
+                conn.commit()
+                company_id = cursor.lastrowid
+            
+            conn.close()
+            
+            company_cache[cnpj] = {"id": company_id, "nome": standardize_company_name(nome_original)}
+            return company_id
 
 def get_xml_info(xml_file: Path) -> dict:
     namespaces = [
@@ -218,41 +250,33 @@ def get_xml_info(xml_file: Path) -> dict:
             "dia_emissao": data_emissao_dt.strftime('%d')
         }
 
-    except Exception as e:
-        logging.debug(f"Erro ao processar {xml_file.name}: {e}")
+    except Exception:
         return None
 
-def register_invoice_in_db(data: dict, file_path: str, file_hash: str) -> bool:
+def batch_insert_notas(batch_data: list) -> int:
+    if not batch_data:
+        return 0
+    
     try:
         with db_lock:
-            conn = sqlite3.connect(DATABASE_FILE, timeout=10)
+            conn = sqlite3.connect(DATABASE_FILE, timeout=20)
             cursor = conn.cursor()
-
-            cursor.execute(
-                "SELECT ID_NF FROM NOTAS_FISCAIS WHERE CHAVE_ACESSO_NF = ? OR HASH_ARQUIVO = ?", 
-                (data["chave_acesso"], file_hash)
-            )
-            if cursor.fetchone():
-                conn.close()
-                return False
-
-            company_id = get_or_create_company(data["cnpj"], data["empresa_original"])
-
-            cursor.execute(
-                '''INSERT INTO NOTAS_FISCAIS 
+            
+            cursor.executemany(
+                '''INSERT OR IGNORE INTO NOTAS_FISCAIS 
                 (CHAVE_ACESSO_NF, HASH_ARQUIVO, ID_EMPRESA, DATA_LEITURA_NF, DATA_EMISSAO_NF, TIPO_DOCUMENTO_NF, CAMINHO_ARQUIVO_NF)
                 VALUES (?, ?, ?, ?, ?, ?, ?)''',
-                (data["chave_acesso"], file_hash, company_id, data["data_leitura"], 
-                 data["data_emissao"], data["tipo_documento"], file_path)
+                batch_data
             )
             
+            inserted = cursor.rowcount
             conn.commit()
             conn.close()
-            return True
-
+            
+            return inserted
     except Exception as e:
-        logging.error(f"Erro ao registrar no banco: {e}")
-        return False
+        logging.error(f"Erro no batch insert: {e}")
+        return 0
 
 def move_file_to_destination(xml_file: Path, info: dict) -> bool:
     try:
@@ -270,20 +294,9 @@ def move_file_to_destination(xml_file: Path, info: dict) -> bool:
         
         shutil.move(str(xml_file), str(destination_file))
         
-        with db_lock:
-            conn = sqlite3.connect(DATABASE_FILE, timeout=10)
-            cursor = conn.cursor()
-            cursor.execute(
-                "UPDATE NOTAS_FISCAIS SET CAMINHO_ARQUIVO_NF = ? WHERE CHAVE_ACESSO_NF = ?", 
-                (str(destination_file), info['chave_acesso'])
-            )
-            conn.commit()
-            conn.close()
-
         return True
 
-    except Exception as e:
-        logging.error(f"Erro ao mover {xml_file.name}: {e}")
+    except Exception:
         return False
 
 def move_to_error_folder(xml_file: Path, reason: str = "erro_processamento"):
@@ -293,16 +306,26 @@ def move_to_error_folder(xml_file: Path, reason: str = "erro_processamento"):
         error_subdir.mkdir(exist_ok=True)
         
         destination = error_subdir / xml_file.name
+        if destination.exists():
+            destination.unlink()
         shutil.move(str(xml_file), str(destination))
         
-    except Exception as e:
-        logging.error(f"Erro ao mover arquivo para pasta de erros: {e}")
+    except Exception:
+        pass
 
 def process_single_file(xml_file: Path) -> dict:
-    result = {"file": xml_file.name, "status": "erro", "reason": ""}
+    result = {"file": xml_file.name, "status": "erro", "reason": "", "data": None}
     
     try:
         file_hash = calculate_file_hash(xml_file)
+        if not file_hash:
+            result["reason"] = "erro_leitura"
+            return result
+        
+        if file_hash in processed_hashes:
+            result["status"] = "duplicado"
+            xml_file.unlink()
+            return result
         
         info = get_xml_info(xml_file)
         if not info:
@@ -310,22 +333,26 @@ def process_single_file(xml_file: Path) -> dict:
             move_to_error_folder(xml_file, "xml_invalido")
             return result
         
-        if not register_invoice_in_db(info, str(xml_file), file_hash):
-            result["status"] = "duplicado"
-            xml_file.unlink()
-            return result
+        company_id = get_or_create_company_cached(info["cnpj"], info["empresa_original"])
         
-        if move_file_to_destination(xml_file, info):
-            result["status"] = "sucesso"
-        else:
-            result["reason"] = "erro_mover"
-            move_to_error_folder(xml_file, "erro_movimentacao")
+        result["data"] = (
+            info["chave_acesso"],
+            file_hash,
+            company_id,
+            info["data_leitura"],
+            info["data_emissao"],
+            info["tipo_documento"],
+            str(xml_file)
+        )
+        result["info"] = info
+        result["hash"] = file_hash
+        result["status"] = "preparado"
+        
+        return result
     
-    except Exception as e:
-        result["reason"] = f"exception: {str(e)[:50]}"
-        move_to_error_folder(xml_file, "erro_geral")
-    
-    return result
+    except Exception:
+        result["reason"] = "exception"
+        return result
 
 def process_batch(xml_files: list) -> dict:
     stats = {"sucesso": 0, "duplicado": 0, "erro": 0}
@@ -333,14 +360,45 @@ def process_batch(xml_files: list) -> dict:
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
         futures = {executor.submit(process_single_file, f): f for f in xml_files}
         
+        results = []
         for future in as_completed(futures):
-            result = future.result()
-            if result["status"] == "sucesso":
-                stats["sucesso"] += 1
-            elif result["status"] == "duplicado":
-                stats["duplicado"] += 1
-            else:
+            try:
+                result = future.result(timeout=20)
+                if result["status"] == "duplicado":
+                    stats["duplicado"] += 1
+                elif result["status"] == "preparado":
+                    results.append(result)
+                else:
+                    stats["erro"] += 1
+            except:
                 stats["erro"] += 1
+    
+    if results:
+        batch_data = [r["data"] for r in results]
+        inserted = batch_insert_notas(batch_data)
+        
+        for r in results:
+            processed_hashes.add(r["hash"])
+        
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+            move_futures = []
+            for r in results:
+                xml_file = Path(r["data"][6])
+                if xml_file.exists():
+                    future = executor.submit(move_file_to_destination, xml_file, r["info"])
+                    move_futures.append((future, xml_file, r["info"]))
+            
+            for future, xml_file, info in move_futures:
+                try:
+                    if future.result(timeout=15):
+                        stats["sucesso"] += 1
+                    else:
+                        move_to_error_folder(xml_file, "erro_movimentacao")
+                        stats["erro"] += 1
+                except:
+                    if xml_file.exists():
+                        move_to_error_folder(xml_file, "erro_movimentacao")
+                    stats["erro"] += 1
     
     return stats
 
@@ -357,26 +415,49 @@ def scan_and_process():
     total = len(xml_files)
     logging.info(f"→ {total} arquivo(s) encontrado(s)")
     
+    start_time = time.time()
+    total_stats = {"sucesso": 0, "duplicado": 0, "erro": 0}
+    batch_num = 0
+    
     for i in range(0, total, BATCH_SIZE):
         batch = xml_files[i:i+BATCH_SIZE]
+        batch_num += 1
+        total_batches = (total + BATCH_SIZE - 1) // BATCH_SIZE
+        
         stats = process_batch(batch)
         
-        if any(stats.values()):
-            logging.info(
-                f"✓ Lote {i//BATCH_SIZE + 1}: "
-                f"{stats['sucesso']} ok | {stats['duplicado']} dup | {stats['erro']} erro"
-            )
+        for key in total_stats:
+            total_stats[key] += stats[key]
+        
+        processed = sum(total_stats.values())
+        elapsed = time.time() - start_time
+        rate = processed / elapsed if elapsed > 0 else 0
+        
+        logging.info(
+            f"✓ Lote {batch_num}/{total_batches}: {stats['sucesso']} ok | "
+            f"{stats['duplicado']} dup | {stats['erro']} erro | "
+            f"{processed}/{total} ({rate:.1f} arq/s)"
+        )
+        
+    elapsed = time.time() - start_time
+    if sum(total_stats.values()) > 0:
+        logging.info(
+            f"✓ CONCLUÍDO: {total_stats['sucesso']} novos | "
+            f"{total_stats['duplicado']} duplicados | {total_stats['erro']} erros | "
+            f"Tempo: {elapsed:.1f}s | Taxa: {total/elapsed:.1f} arq/s"
+        )
 
 def main():
     logging.info("="*60)
-    logging.info("XML ORGANIZER v2.0 - INICIANDO")
+    logging.info("XML ORGANIZER v2.0 TURBO - INICIANDO")
     logging.info(f"Monitorando: {SOURCE_DIRECTORY}")
     logging.info(f"Destino: {DESTINATION_NETWORK_DIRECTORY}")
     logging.info(f"Banco de dados: {DATABASE_FILE}")
-    logging.info(f"Intervalo de verificação: {SCAN_INTERVAL}s")
+    logging.info(f"Workers: {MAX_WORKERS} | Batch: {BATCH_SIZE}")
     logging.info("="*60)
     
     setup_database()
+    load_caches()
     
     cycle = 0
     while True:
