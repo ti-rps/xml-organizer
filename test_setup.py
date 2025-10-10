@@ -1,7 +1,3 @@
-"""
-Script de teste para validar configuração do XML Organizer
-"""
-
 import os
 import sys
 import sqlite3
